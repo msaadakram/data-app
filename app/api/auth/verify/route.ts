@@ -1,59 +1,48 @@
-import { NextResponse } from "next/server";
-import bcrypt from "bcryptjs";
-import { connectDB } from "@/lib/db";
-import { Password } from "@/lib/models";
+import { NextRequest } from "next/server";
+import { verifyPassword, createSession } from "@/lib/auth";
+import { validatePIN } from "@/lib/validation";
+import { successResponse, errorResponse, serverErrorResponse } from "@/lib/api-response";
 
-export async function POST(req: Request) {
+export async function POST(req: NextRequest) {
   try {
-    await connectDB();
-    const { password } = await req.json();
+    const body = await req.json();
+    const { password } = body;
 
-    // Validation
-    if (!password || typeof password !== "string" || !/^\d{4}$/.test(password)) {
-      return NextResponse.json(
-        { success: false, message: "Password must be exactly 4 digits" },
-        { status: 400 }
-      );
+    // Validate PIN format
+    const pinValidation = validatePIN(password);
+    if (!pinValidation.valid) {
+      return errorResponse(pinValidation.error || "Invalid PIN format", 400);
     }
 
-    let record = await Password.findOne();
-
-    // First time: create default password
-    if (!record) {
-      const defaultPassword = process.env.DEFAULT_PASSWORD || "1234";
-      const hash = await bcrypt.hash(defaultPassword, 10);
-      record = await Password.create({ password: hash });
-
-      if (password !== defaultPassword) {
-        return NextResponse.json(
-          { success: false, message: "Invalid password" },
-          { status: 401 }
-        );
-      }
-      return NextResponse.json({
-        success: true,
-        message: "Authenticated with default password",
-      });
+    // Verify password
+    const isValid = await verifyPassword(password);
+    if (!isValid) {
+      return errorResponse("Invalid password", 401);
     }
 
-    const ok = await bcrypt.compare(password, record.password);
-    if (!ok) {
-      return NextResponse.json(
-        { success: false, message: "Invalid password" },
-        { status: 401 }
-      );
-    }
+    // Create session token
+    const sessionToken = createSession();
 
-    return NextResponse.json({
-      success: true,
-      message: "Authentication successful",
+    // Return success with session token
+    const response = successResponse(
+      { token: sessionToken },
+      "Authentication successful",
+      200
+    );
+
+    // Set session token in cookie and header
+    response.cookies.set("session_token", sessionToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+      maxAge: 24 * 60 * 60, // 24 hours
     });
+    response.headers.set("X-Session-Token", sessionToken);
+
+    return response;
   } catch (err: any) {
     console.error("Authentication error:", err);
-    return NextResponse.json(
-      { success: false, message: "Authentication failed", error: err.message },
-      { status: 500 }
-    );
+    return serverErrorResponse("Authentication failed", err.message);
   }
 }
 

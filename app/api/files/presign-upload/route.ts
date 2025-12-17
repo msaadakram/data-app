@@ -1,62 +1,64 @@
-import { NextResponse } from "next/server";
-import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { NextRequest } from "next/server";
+import { PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-
-const s3 = new S3Client({
-  region: process.env.AWS_REGION || "us-east-1",
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
-  },
-});
+import { requireAuth } from "@/lib/auth";
+import { validateFilename, validateFileSize, validateMimeType, sanitizeFilename } from "@/lib/validation";
+import { s3Client, AWS_BUCKET_NAME, validateS3Config } from "@/lib/s3";
+import { successResponse, errorResponse, serverErrorResponse } from "@/lib/api-response";
 
 const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100MB
 
-export async function POST(req: Request) {
+export async function POST(req: NextRequest) {
   try {
+    // Require authentication
+    const authError = await requireAuth(req);
+    if (authError) {
+      return authError;
+    }
+
+    // Validate S3 configuration
+    const s3ConfigValidation = validateS3Config();
+    if (!s3ConfigValidation.valid) {
+      return serverErrorResponse(s3ConfigValidation.error || "S3 configuration error");
+    }
+
     const { filename, mimeType, size } = await req.json();
 
-    // Validation
-    if (!filename || typeof filename !== "string" || filename.trim().length === 0) {
-      return NextResponse.json(
-        { success: false, message: "Invalid filename" },
-        { status: 400 }
-      );
+    // Validate inputs
+    const filenameValidation = validateFilename(filename);
+    if (!filenameValidation.valid) {
+      return errorResponse(filenameValidation.error || "Invalid filename", 400);
     }
 
-    if (!mimeType || typeof mimeType !== "string") {
-      return NextResponse.json(
-        { success: false, message: "Invalid mime type" },
-        { status: 400 }
-      );
+    const mimeTypeValidation = validateMimeType(mimeType);
+    if (!mimeTypeValidation.valid) {
+      return errorResponse(mimeTypeValidation.error || "Invalid mime type", 400);
     }
 
-    if (size && typeof size === "number" && size > MAX_FILE_SIZE) {
-      return NextResponse.json(
-        { success: false, message: `File size exceeds maximum of ${MAX_FILE_SIZE / 1024 / 1024}MB` },
-        { status: 400 }
-      );
+    if (size !== undefined && size !== null) {
+      const sizeValidation = validateFileSize(size, MAX_FILE_SIZE);
+      if (!sizeValidation.valid) {
+        return errorResponse(sizeValidation.error || "Invalid file size", 400);
+      }
     }
 
-    // Sanitize filename to prevent directory traversal
-    const sanitizedFilename = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
+    // Sanitize and generate S3 key
+    const sanitizedFilename = sanitizeFilename(filename);
     const key = `uploads/${Date.now()}-${sanitizedFilename}`;
 
+    // Create presigned URL
     const command = new PutObjectCommand({
-      Bucket: process.env.AWS_BUCKET_NAME!,
+      Bucket: AWS_BUCKET_NAME,
       Key: key,
       ContentType: mimeType,
     });
 
-    const url = await getSignedUrl(s3, command, { expiresIn: 3600 });
+    const url = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
 
-    return NextResponse.json({ success: true, url, key });
+    return successResponse({ url, key }, "Upload URL created successfully", 200);
   } catch (err: any) {
     console.error("Error creating presigned upload URL:", err);
-    return NextResponse.json(
-      { success: false, message: "Failed to create upload URL", error: err.message },
-      { status: 500 }
-    );
+    return serverErrorResponse("Failed to create upload URL", err.message);
   }
 }
 

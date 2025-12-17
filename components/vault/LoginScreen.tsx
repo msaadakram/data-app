@@ -31,11 +31,23 @@ export default function LoginScreen({
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ password }),
+        credentials: "include",
       });
       const data = await res.json();
       if (!res.ok || !data.success) {
         throw new Error(data.message || "Invalid password");
       }
+      
+      // Store session token from response
+      if (data.data?.token) {
+        localStorage.setItem("vault_session_token", data.data.token);
+      }
+      // Also check for token in header
+      const tokenHeader = res.headers.get("X-Session-Token");
+      if (tokenHeader) {
+        localStorage.setItem("vault_session_token", tokenHeader);
+      }
+      
       onSuccess();
     } catch (err: any) {
       setError(err.message || "Invalid password");

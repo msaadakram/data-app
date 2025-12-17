@@ -1,118 +1,129 @@
-import { NextResponse } from "next/server";
-import { S3Client, DeleteObjectCommand } from "@aws-sdk/client-s3";
+import { NextRequest } from "next/server";
+import { DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { connectDB } from "@/lib/db";
 import { File } from "@/lib/models";
+import { requireAuth } from "@/lib/auth";
+import { validateFilename, validateFileSize, validateMimeType, validateObjectId } from "@/lib/validation";
+import { s3Client, AWS_BUCKET_NAME } from "@/lib/s3";
+import { successResponse, errorResponse, notFoundResponse, serverErrorResponse } from "@/lib/api-response";
 
-const s3 = new S3Client({
-  region: process.env.AWS_REGION || "us-east-1",
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
-  },
-});
-
-export async function GET() {
+export async function GET(req: NextRequest) {
   try {
+    // Require authentication
+    const authError = await requireAuth(req);
+    if (authError) {
+      return authError;
+    }
+
     await connectDB();
     const files = await File.find().sort({ uploadedAt: -1 });
-    return NextResponse.json({
-      success: true,
-      files: files.map((f) => ({
-        id: f._id.toString(),
-        filename: f.filename,
-        size: f.size,
-        mimeType: f.mimeType,
-        uploadedAt: f.uploadedAt,
-      })),
-    });
+    
+    const fileData = files.map((f) => ({
+      id: f._id.toString(),
+      filename: f.filename,
+      size: f.size,
+      mimeType: f.mimeType,
+      uploadedAt: f.uploadedAt,
+    }));
+
+    return successResponse({ files: fileData }, undefined, 200);
   } catch (err: any) {
     console.error("Error loading files:", err);
-    return NextResponse.json(
-      { success: false, message: "Failed to load files", error: err.message },
-      { status: 500 }
-    );
+    return serverErrorResponse("Failed to load files", err.message);
   }
 }
 
-export async function POST(req: Request) {
+export async function POST(req: NextRequest) {
   try {
+    // Require authentication
+    const authError = await requireAuth(req);
+    if (authError) {
+      return authError;
+    }
+
     await connectDB();
     const { filename, size, mimeType, s3Key } = await req.json();
 
-    // Validation
-    if (!filename || typeof filename !== "string" || filename.trim().length === 0) {
-      return NextResponse.json(
-        { success: false, message: "Invalid filename" },
-        { status: 400 }
-      );
-    }
-    if (!size || typeof size !== "number" || size <= 0) {
-      return NextResponse.json(
-        { success: false, message: "Invalid file size" },
-        { status: 400 }
-      );
-    }
-    if (!mimeType || typeof mimeType !== "string") {
-      return NextResponse.json(
-        { success: false, message: "Invalid mime type" },
-        { status: 400 }
-      );
-    }
-    if (!s3Key || typeof s3Key !== "string") {
-      return NextResponse.json(
-        { success: false, message: "Invalid S3 key" },
-        { status: 400 }
-      );
+    // Validate all inputs
+    const filenameValidation = validateFilename(filename);
+    if (!filenameValidation.valid) {
+      return errorResponse(filenameValidation.error || "Invalid filename", 400);
     }
 
-    const file = await File.create({ filename: filename.trim(), size, mimeType, s3Key });
-    return NextResponse.json({
-      success: true,
-      file: {
+    const sizeValidation = validateFileSize(size);
+    if (!sizeValidation.valid) {
+      return errorResponse(sizeValidation.error || "Invalid file size", 400);
+    }
+
+    const mimeTypeValidation = validateMimeType(mimeType);
+    if (!mimeTypeValidation.valid) {
+      return errorResponse(mimeTypeValidation.error || "Invalid mime type", 400);
+    }
+
+    if (!s3Key || typeof s3Key !== "string" || s3Key.trim().length === 0) {
+      return errorResponse("Invalid S3 key", 400);
+    }
+
+    // Create file record
+    const file = await File.create({
+      filename: filename.trim(),
+      size,
+      mimeType,
+      s3Key: s3Key.trim(),
+    });
+
+    return successResponse(
+      {
         id: file._id.toString(),
         filename: file.filename,
         size: file.size,
         mimeType: file.mimeType,
         uploadedAt: file.uploadedAt,
       },
-    });
+      "File metadata saved successfully",
+      201
+    );
   } catch (err: any) {
     console.error("Error creating file record:", err);
-    return NextResponse.json(
-      { success: false, message: "Failed to save file metadata", error: err.message },
-      { status: 500 }
-    );
+    return serverErrorResponse("Failed to save file metadata", err.message);
   }
 }
 
-export async function DELETE(req: Request) {
+export async function DELETE(req: NextRequest) {
   try {
+    // Require authentication
+    const authError = await requireAuth(req);
+    if (authError) {
+      return authError;
+    }
+
     await connectDB();
     const { searchParams } = new URL(req.url);
     const id = searchParams.get("id");
 
-    if (!id || typeof id !== "string") {
-      return NextResponse.json(
-        { success: false, message: "File id required" },
-        { status: 400 }
-      );
+    // Validate ID
+    if (!id) {
+      return errorResponse("File ID is required", 400);
     }
 
+    const idValidation = validateObjectId(id);
+    if (!idValidation.valid) {
+      return errorResponse(idValidation.error || "Invalid file ID format", 400);
+    }
+
+    // Find file
     const file = await File.findById(id);
     if (!file) {
-      return NextResponse.json(
-        { success: false, message: "File not found" },
-        { status: 404 }
-      );
+      return notFoundResponse("File not found");
     }
 
     // Delete from S3
     try {
       const deleteCommand = new DeleteObjectCommand({
-        Bucket: process.env.AWS_BUCKET_NAME!,
+        Bucket: AWS_BUCKET_NAME,
         Key: file.s3Key,
       });
-      await s3.send(deleteCommand);
+      await s3Client.send(deleteCommand);
     } catch (s3Err: any) {
       console.error("Error deleting file from S3:", s3Err);
       // Continue to delete from database even if S3 delete fails
@@ -122,13 +133,10 @@ export async function DELETE(req: Request) {
     // Delete from database
     await File.findByIdAndDelete(id);
 
-    return NextResponse.json({ success: true, message: "File deleted successfully" });
+    return successResponse(null, "File deleted successfully");
   } catch (err: any) {
     console.error("Error deleting file:", err);
-    return NextResponse.json(
-      { success: false, message: "Failed to delete file", error: err.message },
-      { status: 500 }
-    );
+    return serverErrorResponse("Failed to delete file", err.message);
   }
 }
 

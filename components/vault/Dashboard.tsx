@@ -55,12 +55,25 @@ export default function Dashboard({
   async function loadFiles() {
     try {
       setError("");
-      const res = await fetch("/api/files");
+      const token = localStorage.getItem("vault_session_token");
+      const res = await fetch("/api/files", {
+        headers: {
+          ...(token && {
+            "Authorization": `Bearer ${token}`,
+            "X-Session-Token": token,
+          }),
+        },
+        credentials: "include",
+      });
       const data = await res.json();
-      if (data.success) {
-        setFiles(data.files);
+      if (data.success && data.data?.files) {
+        setFiles(data.data.files);
       } else {
         setError(data.message || "Failed to load files");
+        if (res.status === 401) {
+          // Session expired, logout
+          onLogout();
+        }
       }
     } catch (e: any) {
       setError(e.message || "Failed to load files");
@@ -86,9 +99,17 @@ export default function Dashboard({
 
     try {
       // Get presigned URL
+      const token = localStorage.getItem("vault_session_token");
       const presignRes = await fetch("/api/files/presign-upload", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(token && {
+            "Authorization": `Bearer ${token}`,
+            "X-Session-Token": token,
+          }),
+        },
+        credentials: "include",
         body: JSON.stringify({
           filename: file.name,
           mimeType: file.type || "application/octet-stream",
@@ -97,7 +118,17 @@ export default function Dashboard({
       });
       const presignData = await presignRes.json();
       if (!presignRes.ok || !presignData.success) {
+        if (presignRes.status === 401) {
+          onLogout();
+        }
         throw new Error(presignData.message || "Failed to prepare upload");
+      }
+
+      const uploadUrl = presignData.data?.url || presignData.url;
+      const s3Key = presignData.data?.key || presignData.key;
+
+      if (!uploadUrl || !s3Key) {
+        throw new Error("Invalid response from server");
       }
 
       // Upload to S3
@@ -115,7 +146,7 @@ export default function Dashboard({
           else reject(new Error("Upload failed"));
         });
         xhr.addEventListener("error", () => reject(new Error("Upload failed")));
-        xhr.open("PUT", presignData.url);
+        xhr.open("PUT", uploadUrl);
         xhr.setRequestHeader("Content-Type", file.type || "application/octet-stream");
         xhr.send(file);
       });
@@ -123,12 +154,19 @@ export default function Dashboard({
       // Save metadata
       const saveRes = await fetch("/api/files", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(token && {
+            "Authorization": `Bearer ${token}`,
+            "X-Session-Token": token,
+          }),
+        },
+        credentials: "include",
         body: JSON.stringify({
           filename: file.name,
           size: file.size,
           mimeType: file.type || "application/octet-stream",
-          s3Key: presignData.key,
+          s3Key: s3Key,
         }),
       });
 
@@ -150,12 +188,24 @@ export default function Dashboard({
   async function handleDownload(id: string, filename: string) {
     try {
       setError("");
-      const res = await fetch(`/api/files/download-url?id=${id}`);
+      const token = localStorage.getItem("vault_session_token");
+      const res = await fetch(`/api/files/download-url?id=${id}`, {
+        headers: {
+          ...(token && {
+            "Authorization": `Bearer ${token}`,
+            "X-Session-Token": token,
+          }),
+        },
+        credentials: "include",
+      });
       const data = await res.json();
-      if (!data.success) {
+      if (!data.success || !data.data?.url) {
+        if (res.status === 401) {
+          onLogout();
+        }
         throw new Error(data.message || "Failed to get download URL");
       }
-      window.open(data.url, "_blank");
+      window.open(data.data.url, "_blank");
     } catch (err: any) {
       setError(err.message || "Download failed");
       console.error(err);
@@ -168,9 +218,22 @@ export default function Dashboard({
     setDeletingId(id);
     try {
       setError("");
-      const res = await fetch(`/api/files?id=${id}`, { method: "DELETE" });
+      const token = localStorage.getItem("vault_session_token");
+      const res = await fetch(`/api/files?id=${id}`, {
+        method: "DELETE",
+        headers: {
+          ...(token && {
+            "Authorization": `Bearer ${token}`,
+            "X-Session-Token": token,
+          }),
+        },
+        credentials: "include",
+      });
       const data = await res.json();
       if (!res.ok || !data.success) {
+        if (res.status === 401) {
+          onLogout();
+        }
         throw new Error(data.message || "Failed to delete file");
       }
       await loadFiles();
